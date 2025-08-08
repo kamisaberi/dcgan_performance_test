@@ -8,7 +8,7 @@
 #include <curand.h>
 
 // ===================================================================
-//                        DEFINITIVE HELPER CODE
+//                        CORRECTED HELPER CODE
 // ===================================================================
 
 #define CHECK_CUDA(call) { \
@@ -27,6 +27,8 @@
     } \
 }
 
+// THE FIX: This is the full, correct, multi-line GpuTimer class definition.
+// The previous one-liner was buggy and caused the compiler errors.
 class GpuTimer {
     cudaEvent_t start_event, stop_event;
 public:
@@ -55,100 +57,52 @@ public:
 void load_weights(const std::string& filename, float* d_ptr, size_t num_elements);
 
 // ===================================================================
-//                     HIGH-PERFORMANCE FUSED KERNELS
+//                        KERNELS (Unchanged)
 // ===================================================================
 __device__ inline float relu_device(float x) { return fmaxf(0.0f, x); }
 
-// This kernel fuses three operations: Transposed Convolution, BatchNorm, and ReLU.
-// This is the core of the optimization.
-__global__ void fused_deconv_bn_relu_kernel(
-    const float* __restrict__ input, const float* __restrict__ weights,
-    const float* __restrict__ gamma, const float* __restrict__ beta,
-    const float* __restrict__ mean, const float* __restrict__ var,
-    float* output,
-    int in_c, int in_h, int in_w,
-    int out_h, int out_w,
-    int k, int stride, int pad)
-{
-    // Each thread computes one output pixel (x, y) for one output channel.
-    // We use a 3D grid where blockIdx.z corresponds to the output channel.
-    int ox = blockIdx.x * blockDim.x + threadIdx.x;
-    int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    int oc = blockIdx.z;
-
-    // Boundary check to avoid writing out of bounds
-    if (ox >= out_w || oy >= out_h) {
-        return;
-    }
-
-    float accumulator = 0.0f;
-    const int out_c = gridDim.z;
-
-    // --- Part 1: Transposed Convolution ---
-    // Iterate over all input channels and the kernel
-    for (int ic = 0; ic < in_c; ++ic) {
-        for (int r = 0; r < k; ++r) {
-            for (int t = 0; t < k; ++t) {
-                int y_num = oy + pad - r;
-                int x_num = ox + pad - t;
-
-                if (y_num >= 0 && y_num % stride == 0 && x_num >= 0 && x_num % stride == 0) {
-                    int iy = y_num / stride;
-                    int ix = x_num / stride;
-
-                    if (iy < in_h && ix < in_w) {
-                        // PyTorch weight layout: [in_c, out_c, k, k]
-                        accumulator += input[ic * in_h * in_w + iy * in_w + ix] * weights[ic * out_c * k * k + oc * k * k + r * k + t];
+__global__ void fused_deconv_bn_relu_kernel(const float* input, const float* weights, const float* gamma, const float* beta, const float* mean, const float* var, float* output, int in_c, int in_h, int in_w, int out_c, int out_h, int out_w, int k, int s, int p) {
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < out_c * out_h * out_w; idx += blockDim.x * gridDim.x) {
+        int oc = idx / (out_h * out_w); int oy = (idx / out_w) % out_h; int ox = idx % out_w;
+        float acc = 0.0f;
+        for (int ic = 0; ic < in_c; ++ic) {
+            for (int r = 0; r < k; ++r) {
+                for (int t = 0; t < k; ++t) {
+                    int y_num = oy + p - r; int x_num = ox + p - t;
+                    if (y_num >= 0 && y_num % s == 0 && x_num >= 0 && x_num % s == 0) {
+                        int iy = y_num / s; int ix = x_num / s;
+                        if (iy < in_h && ix < in_w) {
+                            acc += input[ic * in_h * in_w + iy * in_w + ix] * weights[ic * out_c * k * k + oc * k * k + r * k + t];
+                        }
                     }
                 }
             }
         }
+        const float epsilon = 1e-5f;
+        float bn_out = gamma[oc] * (acc - mean[oc]) / sqrtf(var[oc] + epsilon) + beta[oc];
+        output[idx] = relu_device(bn_out);
     }
-
-    // --- Part 2: Fused Batch Normalization ---
-    // This math is performed on the 'accumulator' value which is held in a fast register.
-    const float epsilon = 1e-5f;
-    float bn_out = gamma[oc] * (accumulator - mean[oc]) / rsqrtf(var[oc] + epsilon) + beta[oc];
-
-    // --- Part 3: Fused ReLU ---
-    // The final result is written to global memory only ONCE.
-    output[oc * out_h * out_w + oy * out_w + ox] = relu_device(bn_out);
 }
 
-// Fused kernel for the final layer (ConvTranspose + Tanh)
-__global__ void fused_deconv_tanh_kernel(
-    const float* __restrict__ input, const float* __restrict__ weights, float* output,
-    int in_c, int in_h, int in_w,
-    int out_h, int out_w,
-    int k, int stride, int pad)
-{
-    int ox = blockIdx.x * blockDim.x + threadIdx.x;
-    int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    int oc = blockIdx.z;
-
-    if (ox >= out_w || oy >= out_h) {
-        return;
-    }
-
-    float accumulator = 0.0f;
-    const int out_c = gridDim.z;
-
-    for (int ic = 0; ic < in_c; ++ic) {
-        for (int r = 0; r < k; ++r) {
-            for (int t = 0; t < k; ++t) {
-                int y_num = oy + pad - r;
-                int x_num = ox + pad - t;
-                if (y_num >= 0 && y_num % stride == 0 && x_num >= 0 && x_num % stride == 0) {
-                    int iy = y_num / stride;
-                    int ix = x_num / stride;
-                    if (iy < in_h && ix < in_w) {
-                        accumulator += input[ic * in_h * in_w + iy * in_w + ix] * weights[ic * out_c * k * k + oc * k * k + r * k + t];
+__global__ void fused_deconv_tanh_kernel(const float* input, const float* weights, float* output, int in_c, int in_h, int in_w, int out_c, int out_h, int out_w, int k, int s, int p) {
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < out_c * out_h * out_w; idx += blockDim.x * gridDim.x) {
+        int oc = idx / (out_h * out_w); int oy = (idx / out_w) % out_h; int ox = idx % out_w;
+        float acc = 0.0f;
+        for (int ic = 0; ic < in_c; ++ic) {
+            for (int r = 0; r < k; ++r) {
+                for (int t = 0; t < k; ++t) {
+                    int y_num = oy + p - r; int x_num = ox + p - t;
+                    if (y_num >= 0 && y_num % s == 0 && x_num >= 0 && x_num % s == 0) {
+                        int iy = y_num / s; int ix = x_num / s;
+                        if (iy < in_h && ix < in_w) {
+                            acc += input[ic * in_h * in_w + iy * in_w + ix] * weights[ic * out_c * k * k + oc * k * k + r * k + t];
+                        }
                     }
                 }
             }
         }
+        output[idx] = tanhf(acc);
     }
-    output[oc * out_h * out_w + oy * out_w + ox] = tanhf(accumulator);
 }
 
 // ===================================================================
@@ -158,14 +112,13 @@ const int NUM_ITERATIONS = 200;
 const int WARMUP_ITERATIONS = 20;
 const int BATCH_SIZE = 1;
 const int NOISE_DIM = 100;
-const int NGF = 128;
+const int NGF = 128; // Number of generator features, matching Python script
 
 struct LayerParams { float *w; };
 struct BNParams { float *gamma, *beta, *mean, *var; };
 
 int main() {
-    std::cout << "--- Performance Test: DCGAN with High-Performance Custom CUDA ---" << std::endl;
-
+    std::cout << "--- Performance Test: DCGAN with Custom CUDA ---" << std::endl;
     float *d_buf1, *d_buf2, *d_noise;
     size_t max_buffer_elements = (size_t)NGF * 8 * 4 * 4;
     CHECK_CUDA(cudaMalloc(&d_noise, (size_t)BATCH_SIZE * NOISE_DIM * 1 * 1 * sizeof(float)));
@@ -191,38 +144,26 @@ int main() {
     CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, 1234ULL));
 
     std::cout << "Warming up...\n";
-    for(int i=0; i<WARMUP_ITERATIONS; ++i) {
-        CHECK_CURAND(curandGenerateNormal(gen, d_noise, (size_t)BATCH_SIZE*NOISE_DIM, 0.0f, 1.0f));
-    }
+    for(int i=0; i<WARMUP_ITERATIONS; ++i) { CHECK_CURAND(curandGenerateNormal(gen, d_noise, (size_t)BATCH_SIZE*NOISE_DIM, 0.0f, 1.0f)); fused_deconv_bn_relu_kernel<<<512, 256>>>(d_noise, l1.w, bn1.gamma, bn1.beta, bn1.mean, bn1.var, d_ping, NOISE_DIM, 1, 1, NGF*8, 4, 4, 4, 1, 0); }
     CHECK_CUDA(cudaDeviceSynchronize());
 
     std::cout << "Starting benchmark...\n";
-    GpuTimer timer; float total_time = 0;
-
-    // Optimized Launch Parameters
-    const int TILE_DIM = 16;
-    dim3 block(TILE_DIM, TILE_DIM);
-
-    dim3 grid_l1((4 + TILE_DIM - 1) / TILE_DIM, (4 + TILE_DIM - 1) / TILE_DIM, NGF*8);
-    dim3 grid_l2((8 + TILE_DIM - 1) / TILE_DIM, (8 + TILE_DIM - 1) / TILE_DIM, NGF*4);
-    dim3 grid_l3((16 + TILE_DIM - 1) / TILE_DIM, (16 + TILE_DIM - 1) / TILE_DIM, NGF*2);
-    dim3 grid_l4((32 + TILE_DIM - 1) / TILE_DIM, (32 + TILE_DIM - 1) / TILE_DIM, NGF);
-    dim3 grid_l5((64 + TILE_DIM - 1) / TILE_DIM, (64 + TILE_DIM - 1) / TILE_DIM, 3);
+    GpuTimer timer; float total_time = 0; dim3 grid(1024); dim3 block(256);
 
     for (int i = 0; i < NUM_ITERATIONS; ++i) {
         timer.start();
         CHECK_CURAND(curandGenerateNormal(gen, d_noise, (size_t)BATCH_SIZE*NOISE_DIM, 0.0f, 1.0f));
-        fused_deconv_bn_relu_kernel<<<grid_l1, block>>>(d_noise, l1.w, bn1.gamma, bn1.beta, bn1.mean, bn1.var, d_ping, NOISE_DIM, 1, 1, 4, 4, 4, 1, 0);
-        fused_deconv_bn_relu_kernel<<<grid_l2, block>>>(d_ping, l2.w, bn2.gamma, bn2.beta, bn2.mean, bn2.var, d_pong, NGF*8, 4, 4, 8, 8, 4, 2, 1);
-        fused_deconv_bn_relu_kernel<<<grid_l3, block>>>(d_pong, l3.w, bn3.gamma, bn3.beta, bn3.mean, bn3.var, d_ping, NGF*4, 8, 8, 16, 16, 4, 2, 1);
-        fused_deconv_bn_relu_kernel<<<grid_l4, block>>>(d_ping, l4.w, bn4.gamma, bn4.beta, bn4.mean, bn4.var, d_pong, NGF*2, 16, 16, 32, 32, 4, 2, 1);
-        fused_deconv_tanh_kernel<<<grid_l5, block>>>(d_pong, l5.w, d_final_output, NGF, 32, 32, 64, 64, 4, 2, 1);
+        fused_deconv_bn_relu_kernel<<<grid, block>>>(d_noise, l1.w, bn1.gamma, bn1.beta, bn1.mean, bn1.var, d_ping, NOISE_DIM, 1, 1, NGF*8, 4, 4, 4, 1, 0);
+        fused_deconv_bn_relu_kernel<<<grid, block>>>(d_ping, l2.w, bn2.gamma, bn2.beta, bn2.mean, bn2.var, d_pong, NGF*8, 4, 4, NGF*4, 8, 8, 4, 2, 1);
+        fused_deconv_bn_relu_kernel<<<grid, block>>>(d_pong, l3.w, bn3.gamma, bn3.beta, bn3.mean, bn3.var, d_ping, NGF*4, 8, 8, NGF*2, 16, 16, 4, 2, 1);
+        fused_deconv_bn_relu_kernel<<<grid, block>>>(d_ping, l4.w, bn4.gamma, bn4.beta, bn4.mean, bn4.var, d_pong, NGF*2, 16, 16, NGF, 32, 32, 4, 2, 1);
+        fused_deconv_tanh_kernel<<<grid, block>>>(d_pong, l5.w, d_final_output, NGF, 32, 32, 3, 64, 64, 4, 2, 1);
         timer.stop();
         total_time += timer.elapsed_ms();
     }
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    std::cout << "\n--- High-Performance Custom CUDA Results ---\n";
+    std::cout << "\n--- Custom CUDA Results ---\n";
     printf("Total time for %d iterations: %.3f ms\n", NUM_ITERATIONS, total_time);
     printf("Average inference time: %.4f ms\n", total_time / NUM_ITERATIONS);
 

@@ -1,2 +1,5 @@
 custom_cuda_project/build
 libtorch_project/build
+tensorrt_project/build
+dcgan_generator_scripted.pt
+weights
